@@ -423,7 +423,7 @@ void InitProcGlobal(void)
         if (i < g_instance.shmem_cxt.MaxConnections + thread_pool_stream_proc_num + AUXILIARY_BACKENDS) {
             /* PGPROC for normal backend and auxiliary backend, add to freeProcs list */
 #ifdef __USE_NUMA
-            auto numa_id = i % nNumaNodes;
+            int numa_id = i % nNumaNodes;
             procs[i]->links.next = (SHM_QUEUE *)g_instance.proc_base->freeProcs[numa_id];
             g_instance.proc_base->freeProcs[numa_id] = procs[i];
             g_instance.proc_base->freeProcCount ++;
@@ -504,6 +504,7 @@ PGPROC *GetFreeProc()
 
     int numaNodeNum = g_instance.shmem_cxt.numaNodeNum;
     PGPROC *current = nullptr;
+    // alloc according numa
     if (t_thrd.threadpool_cxt.worker && g_instance.numa_cxt.inheritThreadPool) {
         int numaNodeNo = t_thrd.threadpool_cxt.worker->GetGroup()->GetNumaId();
         Assert(numaNodeNo<numaNodeNum);
@@ -511,23 +512,31 @@ PGPROC *GetFreeProc()
         // find in current numa first.
         if (current) {
             Assert(current->nodeno == numaNodeNo);
-            g_instance.proc_base->freeProcs[numaNodeNo] = current->links.next;
+            g_instance.proc_base->freeProcs[numaNodeNo] = (PGPROC *)current->links.next;
             g_instance.proc_base->freeProcCount--;
-            return current;
+	    return current;
         }
         // find from other numa
         for(int i = (numaNodeNo+1)%numaNodeNum;i!=numaNodeNo;i=(i+1)%numaNodeNum) {
             current = g_instance.proc_base->freeProcs[i];
             if (current) {
-                g_instance.proc_base->freeProcs[i] = current->links.next;
+                g_instance.proc_base->freeProcs[i] = (PGPROC *)current->links.next;
                 g_instance.proc_base->freeProcCount--;
                 return current;
             }
         }
     }
-    // Never reach here!
-    Assert(false);
-    return NULL;
+    // no numa id 
+    for(int i = 0;i<numaNodeNum;i++){
+    	current = g_instance.proc_base->freeProcs[i];
+	if (current) {
+            Assert(current->nodeno == i);
+            g_instance.proc_base->freeProcs[i] = (PGPROC *)current->links.next;
+            g_instance.proc_base->freeProcCount--;
+	    break;
+	}
+    }
+    return current;
 #else
     if (!g_instance.proc_base->freeProcs) {
         return NULL;
@@ -1277,7 +1286,7 @@ bool HaveNFreeProcs(int n)
 #ifdef __USE_NUMA
     ProcBaseLockAccquire(&g_instance.proc_base_mutex_lock);
 
-    bool has = g_instance.proc.freeProcCount>=n;
+    bool has = (int)g_instance.proc_base->freeProcCount >= n;
 
     ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
 
