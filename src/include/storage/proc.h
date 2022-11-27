@@ -349,6 +349,9 @@ typedef struct PGXACT {
 /* the offset of the last padding if exists*/
 #define PROC_HDR_PAD_OFFSET 112
 
+#ifdef __USE_NUMA
+#define MAX_NUMA_NODE 16
+#endif
 /*
  * There is one ProcGlobal struct for the whole database cluster.
  */
@@ -361,8 +364,15 @@ typedef struct PROC_HDR {
     uint32 allProcCount;
     /* Length of all non-prepared Procs */
     uint32		allNonPreparedProcCount;
+#ifndef __USE_NUMA
     /* Head of list of free PGPROC structures */
     PGPROC* freeProcs;
+#else
+    /* Head of list of free PGPROC structures (16 is MAXNUMANODE)*/
+    PGPROC* freeProcs[MAX_NUMA_NODE];
+    // we can guarantee access freeProcsCount exclusively.
+    uint32 freeProcCount;
+#endif
     /* Head of list of external's free PGPROC structures */
     PGPROC* externalFreeProcs;
     /* Head of list of autovacuum's free PGPROC structures */

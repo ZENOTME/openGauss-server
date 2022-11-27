@@ -271,7 +271,14 @@ void InitProcGlobal(void)
 #ifndef ENABLE_THREAD_CHECK
     g_instance.proc_base->spins_per_delay = DEFAULT_SPINS_PER_DELAY;
 #endif
+#ifndef __USE_NUMA
     g_instance.proc_base->freeProcs = NULL;
+#else
+    for(int i=0;i<MAX_NUMA_NODE;i++){
+        g_instance.proc_base->freeProcs[i] = NULL;
+    }
+    g_instance.proc_base->freeProcCount = 0;
+#endif
     g_instance.proc_base->externalFreeProcs = NULL;
     g_instance.proc_base->autovacFreeProcs = NULL;
     g_instance.proc_base->pgjobfreeProcs = NULL;
@@ -415,8 +422,15 @@ void InitProcGlobal(void)
          */
         if (i < g_instance.shmem_cxt.MaxConnections + thread_pool_stream_proc_num + AUXILIARY_BACKENDS) {
             /* PGPROC for normal backend and auxiliary backend, add to freeProcs list */
+#ifdef __USE_NUMA
+            auto numa_id = i % nNumaNodes;
+            procs[i]->links.next = (SHM_QUEUE *)g_instance.proc_base->freeProcs[numa_id];
+            g_instance.proc_base->freeProcs[numa_id] = procs[i];
+            g_instance.proc_base->freeProcCount ++;
+#else
             procs[i]->links.next = (SHM_QUEUE *)g_instance.proc_base->freeProcs;
             g_instance.proc_base->freeProcs = procs[i];
+#endif
         } else if (i < g_instance.shmem_cxt.MaxConnections + thread_pool_stream_proc_num + AUXILIARY_BACKENDS +
                    g_instance.attr.attr_sql.job_queue_processes + 1) {
             /* PGPROC for pg_job backend, add to pgjobfreeProcs list,  1 for Job Schedule Lancher */
@@ -483,6 +497,38 @@ void InitProcGlobal(void)
  */
 PGPROC *GetFreeProc()
 {
+#ifdef __USE_NUMA
+    if (g_instance.proc_base->freeProcCount==0) {
+        return NULL;
+    }
+
+    int numaNodeNum = g_instance.shmem_cxt.numaNodeNum;
+    PGPROC *current = nullptr;
+    if (t_thrd.threadpool_cxt.worker && g_instance.numa_cxt.inheritThreadPool) {
+        int numaNodeNo = t_thrd.threadpool_cxt.worker->GetGroup()->GetNumaId();
+        Assert(numaNodeNo<numaNodeNum);
+        current = g_instance.proc_base->freeProcs[numaNodeNo];
+        // find in current numa first.
+        if (current) {
+            Assert(current->nodeno == numaNodeNo);
+            g_instance.proc_base->freeProcs[numaNodeNo] = (PGPROC *)current->links.next;
+            g_instance.proc_base->freeProcCount--;
+            return current;
+        }
+        // find from other numa
+        for(int i = (numaNodeNo+1)%numaNodeNum;i!=numaNodeNo;i=(i+1)%numaNodeNum) {
+            current = g_instance.proc_base->freeProcs[i];
+            if (current) {
+                g_instance.proc_base->freeProcs[i] = (PGPROC *)current->links.next;
+                g_instance.proc_base->freeProcCount--;
+                return current;
+            }
+        }
+    }
+    // Never reach here!
+    Assert(false);
+    return NULL;
+#else
     if (!g_instance.proc_base->freeProcs) {
         return NULL;
     }
@@ -510,6 +556,7 @@ PGPROC *GetFreeProc()
     }
 
     return current;
+#endif
 }
 
 /*
@@ -1227,6 +1274,15 @@ void PublishStartupProcessInformation(void)
  */
 bool HaveNFreeProcs(int n)
 {
+#ifdef __USE_NUMA
+    ProcBaseLockAccquire(&g_instance.proc_base_mutex_lock);
+
+    bool has = g_instance.proc_base->freeProcCount>=n;
+
+    ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
+
+    return has;
+#else
     PGPROC* proc = NULL;
 
     ProcBaseLockAccquire(&g_instance.proc_base_mutex_lock);
@@ -1245,6 +1301,7 @@ bool HaveNFreeProcs(int n)
     ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
 
     return (n <= 0);
+#endif
 }
 
 /*
@@ -1378,8 +1435,15 @@ static void ProcPutBackToFreeList()
         t_thrd.proc->links.next = (SHM_QUEUE*)g_instance.proc_base->bgworkerFreeProcs;
         g_instance.proc_base->bgworkerFreeProcs = t_thrd.proc;		
     } else {
+#ifdef __USE_NUMA
+        int numaNodeNo = t_thrd.proc-> nodeno;
+        t_thrd.proc->links.next = (SHM_QUEUE*)g_instance.proc_base->freeProcs[numaNodeNo];
+        g_instance.proc_base->freeProcs[numaNodeNo] = t_thrd.proc;
+        g_instance.proc_base->freeProcCount ++;
+#else
         t_thrd.proc->links.next = (SHM_QUEUE*)g_instance.proc_base->freeProcs;
         g_instance.proc_base->freeProcs = t_thrd.proc;
+#endif
         if (t_thrd.role == WORKER && u_sess->proc_cxt.PassConnLimit) {
             SpinLockAcquire(&g_instance.conn_cxt.ConnCountLock);
             g_instance.conn_cxt.CurConnCount--;
